@@ -60,7 +60,8 @@ DEFAULT_CONFIG: dict = {
         "reasoning": {"backend": "zai", "model": "glm-5.3"},
         "deep_code": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
         "agent_work": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
-        "vision": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
+        "vision": {"backend": "codex-sdk", "model": "gpt-6-astra"},
+        "design_ui": {"backend": "codex-sdk", "model": "gpt-6-astra"},
     },
 }
 

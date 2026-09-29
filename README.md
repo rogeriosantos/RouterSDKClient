@@ -24,7 +24,8 @@ Default table (edit `~/.config/router-warm/config.json`, no restart needed to ch
 read at startup; restart to reload):
 
 - `quick_chat` / `quick_code` / `reasoning` → `zai/glm-5.3`
-- `deep_code` / `agent_work` / `vision` → `claude-sdk/claude-opus-5-5`
+- `deep_code` / `agent_work` → `claude-sdk/claude-opus-5-5`
+- `vision` / `design_ui` → `codex-sdk/gpt-6-astra` — everything visual: screenshots, UI/UX, styling, layouts
 - classifier unreachable → `fallback` (`claude-sdk/claude-opus-5-5`) — the router never becomes the outage
 
 ## Endpoints & security

@@ -15,7 +15,8 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-CATEGORIES = ("quick_chat", "quick_code", "reasoning", "deep_code", "agent_work", "vision")
+CATEGORIES = ("quick_chat", "quick_code", "reasoning", "deep_code", "agent_work", "vision",
+             "design_ui")
 
 _SYSTEM = (
     "You are a routing classifier for a coding assistant. Read the user's request and reply "
@@ -26,6 +27,10 @@ _SYSTEM = (
     "- deep_code: complex implementation, debugging, refactoring, architecture\n"
     "- agent_work: multi-step repo work — run commands, read/edit files, tests, builds\n"
     "- vision: the request has attached images or screenshots to interpret\n"
+    "- design_ui: anything about how software looks or feels — UI/UX, layouts, visual design, "
+    "styling, CSS, colors, typography, design systems, mockups, front-end polish. Pick this "
+    "whenever the subject is visual/design, even if the request is short, conversational, or "
+    "also involves writing code.\n"
     "No other text, no markdown fences."
 )
 

@@ -126,6 +126,7 @@ def test_parse_reply_takes_the_first_known_category():
     assert parse_reply('{"category": "quick_chat"}') == "quick_chat"
     assert parse_reply('```json\n{"category": "deep_code"}\n```') == "deep_code"
     assert parse_reply('Sure! {"category": "vision"} hope that helps') == "vision"
+    assert parse_reply('{"category": "design_ui"}') == "design_ui"
     assert parse_reply('{"category": "nonsense"}') is None
     assert parse_reply("") is None
 
@@ -236,6 +237,20 @@ async def test_dead_backend_is_a_502(stack):
     gw.backends["codex-sdk"] = Backend("codex-sdk", "http://127.0.0.1:1/v1", "k", True)
     status, body = await _http(gw.port, "POST", "/v1/chat/completions", _req("gpt-5.5"))
     assert status == 502 and "unreachable" in body
+
+
+async def test_design_ui_and_vision_route_to_codex(stack):
+    gw = stack
+    gw.fake["zai"].classifier_reply = '{"category": "design_ui"}'
+    status, body = await _http(gw.port, "POST", "/v1/chat/completions",
+                               _req("router/auto", "improve the visual hierarchy of this page"))
+    assert status == 200 and "codex reply" in body
+    assert gw.fake["codex-sdk"].requests[-1]["body"]["model"] == "gpt-6-astra"
+
+    gw.fake["zai"].classifier_reply = '{"category": "vision"}'
+    await _http(gw.port, "POST", "/v1/chat/completions",
+                _req("router/auto", "critique this screenshot", stream=False))
+    assert gw.fake["codex-sdk"].requests[-1]["body"]["model"] == "gpt-6-astra"
 
 
 async def test_unknown_model_is_400(stack):
