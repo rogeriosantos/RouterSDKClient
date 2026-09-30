@@ -60,9 +60,12 @@ DEFAULT_CONFIG: dict = {
         "reasoning": {"backend": "zai", "model": "glm-5.3"},
         "deep_code": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
         "agent_work": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
-        "vision": {"backend": "codex-sdk", "model": "gpt-6-astra"},
+        "vision": {"backend": "zai", "model": "glm-5.3-flash"},
         "design_ui": {"backend": "codex-sdk", "model": "gpt-6-astra"},
     },
+    # Models that reject non-text content parts (z.ai error 1210). A request carrying
+    # images/audio anywhere in its history is moved to the vision route instead.
+    "text_only_models": ["glm-5.3"],
 }
 
 AUTO_MODEL = "router/auto"
@@ -112,6 +115,8 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
                 cfg[section].update(user[section])
         if isinstance(user.get("routes"), dict):
             cfg["routes"].update(user["routes"])
+        if isinstance(user.get("text_only_models"), list):
+            cfg["text_only_models"] = user["text_only_models"]
     except FileNotFoundError:
         pass
     except (json.JSONDecodeError, OSError) as exc:
@@ -158,6 +163,54 @@ def last_user_signal(messages) -> tuple[str, bool]:
             has_images = any(isinstance(p, dict) and p.get("type") == "image_url"
                              for p in content)
     return text, has_images
+
+
+def _is_media(m) -> bool:
+    return (isinstance(m, dict) and isinstance(m.get("content"), list)
+            and any(isinstance(p, dict) and p.get("type") != "text" for p in m["content"]))
+
+
+def has_media(messages) -> bool:
+    """Whether any message (user, tool result, …) carries a non-text content part."""
+    return any(_is_media(m) for m in (messages if isinstance(messages, list) else []))
+
+
+def current_turn_has_media(messages) -> bool:
+    """Media from the last user message onward — what this turn actually needs to look at.
+
+    Older media (e.g. one screenshot early in a long session) must not pin every later
+    turn to the vision model; it is replaced by a placeholder instead.
+    """
+    if not isinstance(messages, list):
+        return False
+    last_user = max((i for i, m in enumerate(messages)
+                     if isinstance(m, dict) and m.get("role") == "user"), default=0)
+    return any(_is_media(m) for m in messages[last_user:])
+
+
+def text_only_messages(messages):
+    """Flatten list contents to plain text, replacing images with a placeholder.
+
+    Classification only looks at the last user turn, so an image earlier in the
+    history (e.g. a screenshot from a tool result) can still reach a text-only model.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            texts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    texts.append(str(p.get("text", "")))
+                else:
+                    texts.append(f"[{p.get('type', 'attachment')} omitted]")
+            m = {**m, "content": "\n".join(t for t in texts if t)}
+        out.append(m)
+    return out
 
 
 async def _read_request(reader: asyncio.StreamReader):
@@ -301,12 +354,19 @@ class Gateway:
             log_decision(log, category, cached, f"{backend_name}/{backend_model}",
                          int((time.monotonic() - t0) * 1000))
 
+        text_only = set(self.config.get("text_only_models", ()))
+        if backend_model in text_only and current_turn_has_media(req.get("messages")):
+            backend_name, backend_model = self.target_for("vision")
+            log_decision(log, "media", False, f"{backend_name}/{backend_model}", 0)
+
         backend = self.backends.get(backend_name)
         if backend is None:
             self._send_json(writer, 500, _error(f"unknown backend {backend_name!r}",
                                                 "server_error"))
             return
         req["model"] = backend_model
+        if backend_model in text_only and has_media(req.get("messages")):   # older media only
+            req["messages"] = text_only_messages(req.get("messages"))
         try:
             out_body = json.dumps(req).encode()
         except (TypeError, ValueError) as exc:

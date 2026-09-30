@@ -239,7 +239,7 @@ async def test_dead_backend_is_a_502(stack):
     assert status == 502 and "unreachable" in body
 
 
-async def test_design_ui_and_vision_route_to_codex(stack):
+async def test_design_ui_routes_to_codex_and_vision_to_glm_flash(stack):
     gw = stack
     gw.fake["zai"].classifier_reply = '{"category": "design_ui"}'
     status, body = await _http(gw.port, "POST", "/v1/chat/completions",
@@ -250,9 +250,55 @@ async def test_design_ui_and_vision_route_to_codex(stack):
     gw.fake["zai"].classifier_reply = '{"category": "vision"}'
     await _http(gw.port, "POST", "/v1/chat/completions",
                 _req("router/auto", "critique this screenshot", stream=False))
-    assert gw.fake["codex-sdk"].requests[-1]["body"]["model"] == "gpt-6-astra"
+    assert gw.fake["zai"].requests[-1]["body"]["model"] == "glm-5.3-flash"
+
+
+async def test_media_in_history_moves_text_only_model_to_vision_route(stack):
+    gw = stack
+    body = _req("glm-5.3")
+    body["messages"] = [
+        {"role": "user", "content": "look at this"},
+        {"role": "user", "content": [{"type": "text", "text": "see"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+    ]
+    status, _ = await _http(gw.port, "POST", "/v1/chat/completions", body)
+    assert status == 200
+    sent = gw.fake["zai"].requests[-1]["body"]
+    assert sent["model"] == "glm-5.3-flash"
+    assert sent["messages"][1]["content"][1]["type"] == "image_url"   # image kept
 
 
 async def test_unknown_model_is_400(stack):
     assert (await _http(stack.port, "POST", "/v1/chat/completions",
                         _req("llama-3")))[0] == 400
+
+
+def test_text_only_messages_strips_images_from_history():
+    from router_warm.gateway import text_only_messages
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "look"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": [{"type": "image_url"}]},
+        {"role": "user", "content": "hello"},
+    ]
+    out = text_only_messages(msgs)
+    assert out[0]["content"] == "look\n[image_url omitted]"
+    assert out[1] == {"role": "tool", "tool_call_id": "c1", "content": "[image_url omitted]"}
+    assert out[2] == msgs[2]
+    assert msgs[0]["content"][1]["type"] == "image_url"   # input untouched
+
+
+async def test_old_media_is_stripped_and_stays_on_text_model(stack):
+    gw = stack
+    body = _req("glm-5.3")
+    body["messages"] = [
+        {"role": "user", "content": [{"type": "text", "text": "see"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "now just chat"},
+    ]
+    status, _ = await _http(gw.port, "POST", "/v1/chat/completions", body)
+    assert status == 200
+    sent = gw.fake["zai"].requests[-1]["body"]
+    assert sent["model"] == "glm-5.3"
+    assert sent["messages"][0]["content"] == "see\n[image_url omitted]"
