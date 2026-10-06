@@ -11,11 +11,11 @@ Routing:
   * Explicit models pass straight through: `glm-*` → the z.ai API, `claude-*` → the
     claude-warm gateway (:8793), `gpt-*` → the codex-warm gateway (:8794). No
     classification, no delay.
-  * `router/auto` asks z.ai first — one tiny GLM call classifies the last user message
-    into quick_chat / quick_code / reasoning / deep_code / agent_work / vision — and a
-    category→(backend, model) table (editable in ~/.config/router-warm/config.json)
-    picks the target. Decisions are cached per message text; if z.ai is unreachable the
-    fallback route is used so the router never becomes the outage.
+  * `router/auto` asks Jev (TypeSafe System One) for category and difficulty in one call.
+    A category × difficulty table (editable in ~/.config/router-warm/config.json) picks
+    the target. Decisions are cached per message
+    text; if TypeSafe is unreachable the fallback route is used so the router never
+    becomes the outage.
 
 Proxying is a byte pump: the backend's status line, headers, SSE stream or JSON body go
 to the client untouched. `X-Pi-Cwd` is forwarded to the two agent gateways so Claude Code
@@ -34,10 +34,13 @@ import logging
 import os
 import re
 import secrets
+import socket
 import ssl
 import sys
 import time
-from dataclasses import dataclass
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,23 +48,77 @@ from .classify import Classifier, log_decision
 
 log = logging.getLogger("router_warm.gateway")
 
+
+@dataclass
+class _Flight:
+    """One in-flight (or just-finished) client request — the router's task tracker."""
+    id: str
+    model_requested: str
+    phase: str                     # classify | routed | waiting | streaming | done | error
+    started: float = field(default_factory=time.monotonic)
+    wall: str = field(default_factory=lambda: time.strftime("%H:%M:%S"))
+    category: str = ""
+    difficulty: str = ""
+    backend: str = ""
+    model: str = ""
+    first_byte_s: float | None = None
+    bytes_out: int = 0
+    total_s: float | None = None
+    detail: str = ""
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        return {
+            "id": self.id, "started": self.wall, "phase": self.phase,
+            "requested": self.model_requested,
+            "category": self.category, "difficulty": self.difficulty,
+            "backend": self.backend, "model": self.model,
+            "elapsed_s": round(now - self.started, 1),
+            "first_byte_s": round(self.first_byte_s, 1) if self.first_byte_s else None,
+            "bytes": self.bytes_out, "total_s": round(self.total_s, 1)
+            if self.total_s is not None else None,
+            "detail": self.detail,
+        }
+
 DEFAULT_PORT = 8795
 CONFIG_DIR = Path.home() / ".config" / "router-warm"
 KEY_FILE = CONFIG_DIR / "gateway.key"
 ZAI_KEY_FILE = CONFIG_DIR / "zai.key"
+JEV_KEY_FILE = CONFIG_DIR / "jev.key"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG: dict = {
-    "classifier": {"model": "glm-5.3-flash", "timeout_s": 8},
+    "classifier": {"model": "jev-latest", "timeout_s": 8},
     "fallback": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
     "routes": {
-        "quick_chat": {"backend": "zai", "model": "glm-5.3"},
-        "quick_code": {"backend": "zai", "model": "glm-5.3"},
-        "reasoning": {"backend": "zai", "model": "glm-5.3"},
-        "deep_code": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
-        "agent_work": {"backend": "claude-sdk", "model": "claude-opus-5-5"},
-        "vision": {"backend": "zai", "model": "glm-5.3-flash"},
-        "design_ui": {"backend": "codex-sdk", "model": "gpt-6-astra"},
+        "quick_chat": {
+            "light": {"backend": "zai", "model": "glm-5.3-flash"},
+            "standard": {"backend": "zai", "model": "glm-5.3"},
+            "hard": {"backend": "zai", "model": "glm-5.3"}},
+        "quick_code": {
+            "light": {"backend": "zai", "model": "glm-5.3-flash"},
+            "standard": {"backend": "zai", "model": "glm-5.3"},
+            "hard": {"backend": "claude-sdk", "model": "claude-sonnet-5-5"}},
+        "reasoning": {
+            "light": {"backend": "zai", "model": "glm-5.3"},
+            "standard": {"backend": "codex-sdk", "model": "gpt-6-sol"},
+            "hard": {"backend": "codex-sdk", "model": "gpt-6-sol"}},
+        "deep_code": {
+            "light": {"backend": "claude-sdk", "model": "claude-sonnet-5-5"},
+            "standard": {"backend": "claude-sdk", "model": "claude-sonnet-5-5"},
+            "hard": {"backend": "claude-sdk", "model": "claude-opus-5-5"}},
+        "agent_work": {
+            "light": {"backend": "codex-sdk", "model": "gpt-6-luna"},
+            "standard": {"backend": "codex-sdk", "model": "gpt-6-luna"},
+            "hard": {"backend": "claude-sdk", "model": "claude-opus-5-5"}},
+        "vision": {
+            "light": {"backend": "zai", "model": "glm-5.3-flash"},
+            "standard": {"backend": "codex-sdk", "model": "gpt-6-luna"},
+            "hard": {"backend": "codex-sdk", "model": "gpt-6-astra"}},
+        "design_ui": {
+            "light": {"backend": "zai", "model": "glm-5.3"},
+            "standard": {"backend": "codex-sdk", "model": "gpt-6-astra"},
+            "hard": {"backend": "claude-sdk", "model": "claude-opus-5-5"}},
     },
     # Models that reject non-text content parts (z.ai error 1210). A request carrying
     # images/audio anywhere in its history is moved to the vision route instead.
@@ -114,7 +171,11 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
             if isinstance(user.get(section), dict):
                 cfg[section].update(user[section])
         if isinstance(user.get("routes"), dict):
-            cfg["routes"].update(user["routes"])
+            for category, levels in user["routes"].items():
+                if isinstance(levels, dict) and isinstance(cfg["routes"].get(category), dict):
+                    cfg["routes"][category].update(levels)
+                else:
+                    cfg["routes"][category] = levels
         if isinstance(user.get("text_only_models"), list):
             cfg["text_only_models"] = user["text_only_models"]
     except FileNotFoundError:
@@ -246,12 +307,24 @@ class Gateway:
         self.config = config or load_config()
         self.backends = backends or default_backends()
         self.classifier = classifier or Classifier(
-            base_url=self.backends["zai"].base_url,
-            api_key=self.backends["zai"].api_key,
+            base_url=os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai"),
+            api_key=os.environ.get("TYPESAFE_API_KEY") or read_key_file(JEV_KEY_FILE),
             model=self.config["classifier"]["model"],
             timeout_s=float(self.config["classifier"].get("timeout_s", 8)))
         self._ssl = ssl.create_default_context()
         self._server: asyncio.AbstractServer | None = None
+        self.inflight: dict[str, _Flight] = {}
+        self.recent: deque[_Flight] = deque(maxlen=20)
+        self.counters: dict[str, int] = {"requests": 0, "failovers": 0,
+                                         "unreachable": 0, "errors": 0}
+
+    def _status(self) -> dict:
+        return {
+            "pid": os.getpid(),
+            "inflight": [fl.snapshot() for fl in self.inflight.values()],
+            "recent": [fl.snapshot() for fl in self.recent],
+            "counters": dict(self.counters),
+        }
 
     def route(self, model: str) -> tuple[str, str]:
         """→ (backend_name, backend_model) for a requested model id."""
@@ -262,13 +335,23 @@ class Gateway:
             return "", ""                    # decided per request by the classifier
         raise ValueError(f"unknown model {model!r}")
 
-    def target_for(self, category: str) -> tuple[str, str]:
-        route = self.config["routes"].get(category) or self.config["fallback"]
+    def target_for(self, category: str, difficulty: str = "standard") -> tuple[str, str]:
+        per_diff = self.config["routes"].get(category) or {}
+        route = per_diff.get(difficulty) or per_diff.get("standard") or self.config["fallback"]
         return route["backend"], route["model"]
 
     async def start(self) -> "Gateway":
-        self._server = await asyncio.start_server(self._on_client, self.host, self.port,
-                                                  limit=1 << 20)
+        # SO_REUSEPORT: several gateway instances share the port; if one dies, its
+        # sibling keeps accepting (war-horse mode — launchd restarts the dead one).
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):            # not everywhere — degrade to solo bind
+            pass
+        sock.bind((self.host, self.port))
+        sock.listen(256)
+        self._server = await asyncio.start_server(self._on_client, sock=sock)
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 
@@ -294,6 +377,8 @@ class Gateway:
                 self._send_json(writer, 200, {"object": "list", "data": [
                     {"id": m, "object": "model", "created": 0, "owned_by": "router"}
                     for m in self.model_ids()]})
+            elif path == "/v1/status" and method == "GET":
+                self._send_json(writer, 200, self._status())
             elif path == "/v1/chat/completions" and method == "POST":
                 await self._chat(body, headers, reader, writer)
             else:
@@ -316,7 +401,8 @@ class Gateway:
     def model_ids(self) -> list[str]:
         ids = [AUTO_MODEL]
         ids += [f"glm-{m}" for m in ("5.3", "5.3-flash", "5.3-highspeed", "5.2", "4.7")]
-        ids += ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5"]
+        ids += ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5",
+                "claude-sonnet-5", "claude-haiku-4-5"]
         ids += ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
                 "gpt-5.6-luna", "gpt-5.5"]
         return ids
@@ -346,52 +432,107 @@ class Gateway:
             self._send_json(writer, 400, _error(f"bad request: {exc}"))
             return
 
+        difficulty = "standard"
+        fl = _Flight(id=uuid.uuid4().hex[:8], model_requested=requested, phase="routed")
+        self.inflight[fl.id] = fl
+        self.counters["requests"] += 1
+        try:
+            await self._chat_tracked(req, requested, backend_name, backend_model, difficulty,
+                                     headers, reader, writer, fl)
+        finally:
+            fl.total_s = time.monotonic() - fl.started
+            self.recent.append(fl)
+            self.inflight.pop(fl.id, None)
+            log.info("req %s %-9s %-11s → %s/%s first=%.1fs total=%.1fs bytes=%d%s",
+                     fl.id, fl.phase, fl.category or "-",
+                     fl.backend or "-", fl.model or "-",
+                     fl.first_byte_s or -1, fl.total_s, fl.bytes_out,
+                     f" ({fl.detail})" if fl.detail else "")
+
+    async def _chat_tracked(self, req: dict, requested: str, backend_name: str,
+                            backend_model: str, difficulty: str, headers: dict[str, str],
+                            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                            fl: _Flight) -> None:
         if backend_name == "":                     # router/auto → classify
+            fl.phase = "classify"
             text, has_images = last_user_signal(req.get("messages"))
             t0 = time.monotonic()
-            category, cached = await self.classifier.classify(text, has_images)
-            backend_name, backend_model = self.target_for(category)
-            log_decision(log, category, cached, f"{backend_name}/{backend_model}",
-                         int((time.monotonic() - t0) * 1000))
+            category, difficulty, cached, note = await self.classifier.classify(text, has_images)
+            backend_name, backend_model = self.target_for(category, difficulty)
+            fl.category, fl.difficulty, fl.phase = category, difficulty, "routed"
+            log_decision(log, category, difficulty, cached, f"{backend_name}/{backend_model}",
+                         int((time.monotonic() - t0) * 1000), note)
+        fl.backend, fl.model = backend_name, backend_model
 
         text_only = set(self.config.get("text_only_models", ()))
         if backend_model in text_only and current_turn_has_media(req.get("messages")):
-            backend_name, backend_model = self.target_for("vision")
-            log_decision(log, "media", False, f"{backend_name}/{backend_model}", 0)
+            backend_name, backend_model = self.target_for("vision", difficulty)
+            fl.backend, fl.model, fl.detail = backend_name, backend_model, "media→vision"
+            log_decision(log, "media", difficulty, False, f"{backend_name}/{backend_model}", 0)
 
         backend = self.backends.get(backend_name)
         if backend is None:
             self._send_json(writer, 500, _error(f"unknown backend {backend_name!r}",
                                                 "server_error"))
             return
-        req["model"] = backend_model
-        if backend_model in text_only and has_media(req.get("messages")):   # older media only
-            req["messages"] = text_only_messages(req.get("messages"))
         try:
-            out_body = json.dumps(req).encode()
+            out_body, extra = self._payload(req, backend, backend_model, headers)
         except (TypeError, ValueError) as exc:
             self._send_json(writer, 400, _error(f"unserializable request: {exc}"))
             return
 
-        extra = {}
+        status = await self._proxy(backend, out_body, extra, reader, writer, fl)
+        if status == "unreachable":
+            self.counters["unreachable"] += 1
+            # router/auto never surfaces a dead backend: fail over to the fallback route.
+            if requested == AUTO_MODEL:
+                fb_name = self.config["fallback"]["backend"]
+                fb_model = self.config["fallback"]["model"]
+                fb = self.backends.get(fb_name)
+                if fb and fb_name != backend_name:
+                    log.warning("failover: %s/%s unreachable → %s/%s", backend_name,
+                                backend_model, fb_name, fb_model)
+                    fl.backend, fl.model = fb_name, fb_model
+                    fl.detail = f"failover {backend_name}→{fb_name}"
+                    self.counters["failovers"] += 1
+                    try:
+                        fb_body, fb_extra = self._payload(req, fb, fb_model, headers)
+                    except (TypeError, ValueError):
+                        fb_body, fb_extra = out_body, extra
+                    status = await self._proxy(fb, fb_body, fb_extra, reader, writer, fl)
+            if status == "unreachable":
+                fl.phase = "error"
+                self.counters["errors"] += 1
+                self._send_json(writer, 502, _error(
+                    f"backend {backend.name} unreachable", "server_error"))
+                return
+        fl.phase = "done"
+
+    def _payload(self, req: dict, backend: Backend, backend_model: str,
+                 headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
+        """Serialize the request for `backend`, applying text-only media stripping."""
+        text_only = set(self.config.get("text_only_models", ()))
+        req["model"] = backend_model
+        if backend_model in text_only and has_media(req.get("messages")):   # older media only
+            req["messages"] = text_only_messages(req.get("messages"))
+        extra: dict[str, str] = {}
         if backend.forwards_cwd:
             cwd = headers.get("x-pi-cwd")
             if cwd:
                 extra["X-Pi-Cwd"] = cwd
-
-        await self._proxy(backend, out_body, extra, reader, writer)
+        return json.dumps(req).encode(), extra
 
     async def _proxy(self, backend: Backend, body: bytes, extra: dict[str, str],
-                     reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                     reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                     fl: _Flight | None = None) -> str:
+        """Pump one request to the backend. → "ok" | "unreachable" (client untouched)."""
         host, port, path, tls = backend.target()
         try:
             kwargs: dict[str, Any] = {"ssl": self._ssl} if tls else {}
             b_reader, b_writer = await asyncio.open_connection(host, port, **kwargs)
         except (OSError, ConnectionError) as exc:
             log.warning("backend %s unreachable: %s", backend.name, exc)
-            self._send_json(writer, 502, _error(f"backend {backend.name} unreachable: {exc}",
-                                                "server_error"))
-            return
+            return "unreachable"
 
         head = (f"POST {path} HTTP/1.1\r\nHost: {host}\r\n"
                 f"Authorization: Bearer {backend.api_key}\r\n"
@@ -401,6 +542,8 @@ class Gateway:
                 + "\r\n").encode()
         b_writer.write(head + body)
         await b_writer.drain()
+        if fl:
+            fl.phase = "waiting"
 
         client_gone = asyncio.Event()
 
@@ -411,12 +554,30 @@ class Gateway:
                 pass
             client_gone.set()
 
+        async def heartbeat() -> None:
+            """The 'still waiting' beacon: log every 30s until the first byte lands."""
+            while True:
+                await asyncio.sleep(30)
+                if fl and fl.first_byte_s is None:
+                    wait_s = time.monotonic() - fl.started
+                    log.info("req %s: waiting %.0fs for first byte from %s/%s…",
+                             fl.id, wait_s, backend.name, fl.model)
+
         watcher = asyncio.create_task(watch_client())
+        beater = asyncio.create_task(heartbeat()) if fl else None
         try:
             while True:
                 chunk = await b_reader.read(65536)
                 if not chunk:
                     break
+                if fl:
+                    if fl.first_byte_s is None:
+                        fl.first_byte_s = time.monotonic() - fl.started
+                        fl.phase = "streaming"
+                        if fl.first_byte_s >= 2:
+                            log.info("req %s: first byte from %s/%s after %.1fs",
+                                     fl.id, backend.name, fl.model, fl.first_byte_s)
+                    fl.bytes_out += len(chunk)
                 writer.write(chunk)
                 await writer.drain()
                 if client_gone.is_set():
@@ -426,10 +587,13 @@ class Gateway:
             pass                                  # client vanished mid-stream
         finally:
             watcher.cancel()
+            if beater:
+                beater.cancel()
             try:
                 b_writer.close()
             except Exception:  # noqa: BLE001
                 pass
+        return "ok"
 
 
 def default_backends() -> dict[str, Backend]:
@@ -447,24 +611,46 @@ def default_backends() -> dict[str, Backend]:
 
 async def serve(host: str, port: int, key_file: Path) -> None:
     gw = await Gateway(host=host, port=port, api_key=load_or_create_key(key_file)).start()
-    routes = ", ".join(f"{k}→{v['backend']}/{v['model']}"
-                       for k, v in gw.config["routes"].items())
+    routes = "; ".join(
+        f"{cat}: " + "/".join(str(per.get(d, {}).get("model", "?"))
+                                for d in ("light", "standard", "hard"))
+        for cat, per in gw.config["routes"].items())
     log.info("router-warm gateway on http://%s:%s/v1 (classifier %s; fallback %s/%s)",
              host, gw.port, gw.classifier.model, gw.config["fallback"]["backend"],
              gw.config["fallback"]["model"])
-    log.info("routes: %s", routes)
+    log.info("routes (light/standard/hard): %s", routes)
     try:
         await asyncio.Event().wait()
     finally:
         await gw.aclose()
 
 
+def _trim_log(path: str, max_bytes: int = 5_000_000, keep: int = 2_000_000) -> None:
+    """Keep the launchd-captured log bounded: past 5 MB, keep the newest 2 MB."""
+    try:
+        p = Path(path)
+        if p.stat().st_size > max_bytes:
+            with p.open("rb") as fh:
+                fh.seek(-keep, os.SEEK_END)
+                tail = fh.read()
+            with p.open("wb") as fh:
+                fh.write(tail)
+    except OSError:
+        pass                                          # never block startup on log surgery
+
+
 def main(argv: list[str] | None = None) -> None:
+    import faulthandler
+    faulthandler.enable()          # dump Python tracebacks on fatal signals — see silent deaths
     ap = argparse.ArgumentParser(prog="router-warm-gateway", description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--key-file", type=Path, default=KEY_FILE)
+    ap.add_argument("--log-trim", default=None, metavar="PATH",
+                    help="bound this log file (5 MB cap, newest 2 MB kept)")
     args = ap.parse_args(argv)
+    if args.log_trim:
+        _trim_log(args.log_trim)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
